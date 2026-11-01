@@ -85,7 +85,7 @@ _BS4_AVAILABLE: bool = False
 _BS4_IMPORT_ERROR: ImportError | None = None
 try:  # pragma: no cover - import-time guard
     from bs4 import BeautifulSoup, NavigableString, PageElement, Tag
-    from bs4.element import Comment, PreformattedString
+    from bs4.element import PreformattedString
 
     _BS4_AVAILABLE = True
 except ImportError as e:  # pragma: no cover - import-time guard
@@ -2548,19 +2548,16 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
     def _extract_preformatted_text(self, tag: Tag) -> str:
         """Extract a ``<pre>`` block without normal-flow whitespace rules.
 
-        BeautifulSoup marks text inside ``<pre>`` as ``PreformattedString``.
-        The normal annotation extractor intentionally ignores those nodes and
-        also inserts separators between annotated fragments.  Both behaviours
-        lose significant code whitespace when a preformatted block contains
-        inline elements.  Walk the DOM directly so text-node boundaries are
-        concatenated exactly as written and explicit ``<br>`` tags remain
-        line breaks.
+        The normal annotation extractor inserts separators between annotated
+        fragments. This loses significant code whitespace inside inline
+        elements. Walk the DOM directly so text-node boundaries are concatenated
+        exactly as written and preprocessed ``<br>`` sentinels remain line breaks.
         """
 
         parts: list[str] = []
 
         def append_text(item: PageElement) -> None:
-            if isinstance(item, Comment):
+            if isinstance(item, PreformattedString):
                 return
             if isinstance(item, NavigableString):
                 parts.append(str(item))
@@ -3556,8 +3553,28 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
         elif tag_name in {"pre"}:
             # handle monospace code snippets (pre).
             language_hint = self._code_language_hint(tag)
-            has_hyperlink = any(anchor.get("href") for anchor in tag.find_all("a"))
-            if not has_hyperlink:
+            text_list = self._extract_text_and_hyperlink_recursively(
+                tag, find_parent_annotation=True, keep_newlines=True
+            )
+            annotated_texts = text_list.simplify_text_elements()
+            has_annotations = any(
+                part.hyperlink is not None or part.formatting is not None
+                for part in annotated_texts
+            )
+            has_inline_style = tag.has_attr("style") or any(
+                child.has_attr("style") for child in tag.find_all(True)
+            )
+            has_other_markup = any(
+                child.name not in {"span", "br", *_CODE_TAG_SET}
+                or child.has_attr("role")
+                or self._is_checkbox_like_tag(child)
+                or self._is_checkbox_label_tag(child)
+                for child in tag.find_all(True)
+            )
+            render_page = cast(HTMLBackendOptions, self.options).render_page
+            if not (
+                has_annotations or has_inline_style or has_other_markup or render_page
+            ):
                 text_orig = self._extract_preformatted_text(tag)
                 if text_orig:
                     text_clean = HTMLDocumentBackend._clean_unicode(text_orig)
@@ -3574,12 +3591,8 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
                     )
                     added_refs.append(docling_code.get_ref())
             else:
-                # Keep the existing inline-group behaviour for hyperlinks until
-                # the single-item link semantics are explicitly defined.
-                text_list = self._extract_text_and_hyperlink_recursively(
-                    tag, find_parent_annotation=True, keep_newlines=True
-                )
-                annotated_texts = text_list.simplify_text_elements()
+                # Preserve annotation, CSS-boundary and rendered-provenance
+                # behavior until their single-item semantics are defined.
                 with self._use_inline_group(annotated_texts, doc) as inline_ref:
                     for annotated_text in annotated_texts:
                         # In preformatted text, each <br> is a newline
